@@ -16,22 +16,23 @@ define("model_name", default='124M', help="name of pretrained model to load")
 define("batch_size", default=5, help="batch size to generate text with gpt2")
 define("nsamples", default=5, help="num of samples parameters as defined in gpt2 doc")
 define("threshold", default=7, help="length of words before model generates text")
+define("text_length", default=5, help="length of words generated")
 
 
 class ModelHandler(object):
 	
 	def __init__(self):
-		self.initializeModel()
 		self.cache = ""
-		self.threshold = 7 # default
+		self.threshold = options.threshold # default
 		self.generated_text = ""
 		self.results = ""
 		self.file_name = "training_data.txt"
 		self.sess = None
+		self.initializeModel()
 
 	def initializeModel(self):
 		if not os.path.isdir(os.path.join("models", options.model_name)):
-			if optios.debug:
+			if options.debug:
 				print(f"Downloading {options.model_name} model...")
 
 			gpt2.download_gpt2(model_name=options.model_name)   # model is saved into current directory under /models/124M/
@@ -42,70 +43,72 @@ class ModelHandler(object):
 			url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 			data = requests.get(url)
 		
-			with open(file_name, 'w') as f:
+			with open(self.file_name, 'w') as f:
 				f.write(data.text)
 
+		self.sess = gpt2.start_tf_sess()
+
 		if not os.path.isdir(os.path.join("checkpoint", "run1")):
-			gpt2.finetune(sess, file_name, model_name=options.model_name,steps=100)
+			gpt2.finetune(self.sess, self.file_name, model_name=options.model_name,steps=10)
 		else:
-			self.sess = gpt2.start_tf_sess()
 			gpt2.load_gpt2(self.sess)
 
-	@gen.coroutine
-	def train_model(self, steps):
+	async def train_model(self, steps):
 		if os.path.isfile(self.file_name):
 			file_size = os.path.getsize(self.file_name)
 
 			if file_size> 80 * 1000000:
 				temp = 'encoded%s.npz'%str(random())
-				yield gpt2.encode_dataset(self.file_name, out_path=temp)
-				yield gpt2.finetune(self.sess, temp, overwrite=True, mode_name=options.model_name, steps=steps)
+				await gpt2.encode_dataset(self.file_name, out_path=temp)
+				await gpt2.finetune(self.sess, temp, overwrite=True, mode_name=options.model_name, steps=steps)
 			else:
-				yield gpt2.finetune(self.sess, self.file_name, overwrite=True, mode_name=options.model_name, steps=steps)
+				await gpt2.finetune(self.sess, self.file_name, overwrite=True, mode_name=options.model_name, steps=steps)
 
 		self.sess = gpt2.start_tf_sess()
 		gpt2.load_gpt2(sess)
-
-	def generate_text(self, prefix, text_length=50):
+	
+	async def generate_text(self, prefix, text_length=options.text_length):
 		gen_text = gpt2.generate(self.sess, length=text_length,
 		 prefix=prefix, nsamples=options.nsamples, 
 		 batch_size=options.batch_size, return_as_list=True)[0]
 
-		self.results+=gen_text;
+		self.results=gen_text;
 
-	def add_message(self, prefix):
+	async def add_message(self, prefix):
 		self.cache+=prefix
 		if(len(self.cache)>self.threshold):
-			self.generate_text(self.cache)
+			await self.generate_text(self.cache)
 
 
 
 
 model_handler = ModelHandler()
 model_handler.threshold = options.threshold
-
+# test = 0
 class Generator(tornado.websocket.WebSocketHandler):
-	handler_copy = copy.deepcopy(model_handler)
 
 	def check_origin(self, origin):
 		return True
+	def open(self):
+		self.model_handler_gen = copy.copy(model_handler)
+	async def on_message(self, message):
+		await self.model_handler_gen.add_message(message)
 
-	def on_message(self, message):
-		handler_copy.add_message(message)
-
-		self.write_message(handler_copy.results)
+		self.write_message(self.model_handler_gen.results)
 
 class Trainer(tornado.web.RequestHandler):
-	def post(self):
+	def initialize(self):
+		self.model_handler = ModelHandler()
+	async def post(self):
 		file = self.request.files['training_data'][0]
 		steps = self.request['steps']
-		output_file = open(model_handler.file_name, 'wb')
+		output_file = open(self.model_handler.file_name, 'wb')
 		output_file.write(file['body'])
 
 		if not steps:
-			model_handler.finetune(steps)
+			await self.model_handler.finetune(steps)
 		else:
-			model_handler.finetune()
+			await self.model_handler.finetune()
 
 		self.finish("Data successfully uploaded and training has started")
 
